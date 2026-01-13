@@ -6,9 +6,11 @@ import torchvision.utils
 from torch_kmeans import KMeans
 
 import os
+import math
 
 import injection_utils
 import utils
+from maler_losses import MALeRLosses
 
 
 class BoundedAttention(injection_utils.AttentionBase):
@@ -38,7 +40,8 @@ class BoundedAttention(injection_utils.AttentionBase):
         start_step_size=18,
         end_step_size=5,
         loss_stopping_value=0.2,
-        min_clustering_step=15,
+        min_clustering_step=51, # MALeR: Not using bounded denoising
+        max_masking_step=None, # MALeR: argument for max masking step
         cross_mask_threshold=0.2,
         self_mask_threshold=0.2,
         delta_refine_mask_steps=5,
@@ -52,6 +55,15 @@ class BoundedAttention(injection_utils.AttentionBase):
         delta_debug_mask_steps=5,
         debug_layers=None,
         saved_resolution=64,
+        # MALeR: Hyperparams
+        early_iterations=5,
+        early_gd_iterations=5,
+        lambda_reg=0.0,
+        reg_type=False,
+        lambda_kl=0.0,
+        kl_type=False,
+        sym_kl=2.0,
+        dissim=1.0,
     ):
         super().__init__()
         self.boxes = boxes
@@ -75,6 +87,7 @@ class BoundedAttention(injection_utils.AttentionBase):
         self.step_size_coef = (end_step_size - start_step_size) / max_guidance_iter
         self.loss_stopping_value = loss_stopping_value
         self.min_clustering_step = min_clustering_step
+        self.max_masking_step = max_masking_step if max_masking_step is not None else 1000 # MALeR: argument for max masking step
         self.cross_mask_threshold = cross_mask_threshold
         self.self_mask_threshold = self_mask_threshold
 
@@ -91,7 +104,7 @@ class BoundedAttention(injection_utils.AttentionBase):
         self.delta_debug_mask_steps = delta_debug_mask_steps
         self.debug_layers = self.cross_loss_layers | self.self_loss_layers if debug_layers is None else debug_layers
         self.saved_resolution = saved_resolution
-
+        self.subject_attn_maps = {} # MALeR: attention maps for subject attributes
         self.optimized = False
         self.cross_foreground_values = []
         self.self_foreground_values = []
@@ -102,6 +115,12 @@ class BoundedAttention(injection_utils.AttentionBase):
         self.mean_self_map = 0
         self.num_self_maps = 0
         self.self_masks = None
+        # # # MALeR: Hyperparams
+        self.sym_kl = sym_kl
+        self.dissim = dissim
+        self.early_iterations = early_iterations
+        self.early_gd_iterations = early_gd_iterations
+        self.maler_losses = MALeRLosses(lambda_reg, reg_type, lambda_kl, kl_type, early_iterations, 0.001, False)
 
     def clear_values(self, include_maps=False):
         lists = (
@@ -120,6 +139,9 @@ class BoundedAttention(injection_utils.AttentionBase):
             self.mean_self_map = 0
             self.num_self_maps = 0
 
+        if include_maps:
+            self.subject_attn_maps = {}  # MALeR: subject attention maps
+
     def before_step(self):
         self.clear_values()
         if self.cur_step == 0:
@@ -130,6 +152,8 @@ class BoundedAttention(injection_utils.AttentionBase):
         super().reset()
 
     def forward(self, q, k, v, is_cross, place_in_unet, num_heads, **kwargs):
+        if self.cur_step > self.max_masking_step:
+            return super().forward(q, k, v, is_cross, place_in_unet, num_heads, **kwargs)
         batch_size = q.size(0) // num_heads
         n = q.size(1)
         d = k.size(1)
@@ -155,7 +179,7 @@ class BoundedAttention(injection_utils.AttentionBase):
         out = torch.bmm(attn, v)
         return einops.rearrange(out, '(b h) n d -> b n (h d)', h=num_heads)
 
-    def update_loss(self, forward_pass, latents, i):
+    def update_loss(self, forward_pass, latents, prev_latents, i):
         if i >= self.max_guidance_iter:
             return latents
 
@@ -165,7 +189,9 @@ class BoundedAttention(injection_utils.AttentionBase):
         normalized_loss = torch.tensor(10000)
         with torch.enable_grad():
             latents = latents.clone().detach().requires_grad_(True)
-            for guidance_iter in range(self.max_guidance_iter_per_step):
+            outside_bbox_mask = self.maler_losses.compute_outside_bbox_mask(latents, self.boxes) # MALeR: outside bbox mask
+            current_max_iter = self.early_gd_iterations if i < self.early_iterations else self.max_guidance_iter_per_step # MALeR: for control of opt of early steps
+            for guidance_iter in range(current_max_iter):
                 if normalized_loss < self.loss_stopping_value:
                     break
 
@@ -175,6 +201,7 @@ class BoundedAttention(injection_utils.AttentionBase):
                 self.cur_step = cur_step
 
                 loss, normalized_loss = self._compute_loss()
+                loss += self.maler_losses.compute_loss(latents, prev_latents, outside_bbox_mask, i) # MALeR: KL and reg loss
                 grad_cond = torch.autograd.grad(loss, [latents])[0]
                 latents = latents - step_size * grad_cond
                 if self.debug:
@@ -322,6 +349,41 @@ class BoundedAttention(injection_utils.AttentionBase):
             ((not is_cross) and (self.cur_att_layer not in self.self_loss_layers))
         ):
             return
+        # # # MALeR: attn maps dict for similarity and dissimilarity
+        if is_cross:
+            attn_mean_heads = attn.mean(dim=1)  # [batch, pixels, seq_len]
+            # MALeR: mapping subject token for bbox indices
+            subject_mask_mapping = {}
+            current_mask_idx = 0
+
+            for subject_indices in self.subject_token_indices:  # MALeR: indices to tuple so it can be used as a dictionary key
+                if tuple(subject_indices) not in subject_mask_mapping:
+                    subject_mask_mapping[tuple(subject_indices)] = []
+                subject_mask_mapping[tuple(subject_indices)].append(current_mask_idx)
+                current_mask_idx += 1
+
+            for subject_indices, mask_indices in subject_mask_mapping.items():  # MALeR: getting modifier and noun attention maps
+                if len(subject_indices) > 1:
+                    for mask_idx in mask_indices:
+                        noun_idx = subject_indices[-1]
+                        noun_attn = attn_mean_heads[:, :, noun_idx]
+
+                        modifier_indices = subject_indices[:-1]
+
+                        for modifier_idx in modifier_indices:
+                            modifier_attn = attn_mean_heads[:, :, modifier_idx]
+
+                            key = ((tuple(subject_indices), modifier_idx, noun_idx), mask_idx)
+                            if key not in self.subject_attn_maps:
+                                self.subject_attn_maps[key] = {
+                                    'modifier': [],
+                                    'noun': [],
+                                    'layer_count': 0
+                                }
+
+                            self.subject_attn_maps[key]['modifier'].append(modifier_attn) # MALeR: append for later loss calculation
+                            self.subject_attn_maps[key]['noun'].append(noun_attn)
+                            self.subject_attn_maps[key]['layer_count'] += 1
 
         resolution = int(attn.size(2) ** 0.5)
         boxes = self._convert_boxes_to_masks(resolution, device=attn.device)  # s n
@@ -353,11 +415,21 @@ class BoundedAttention(injection_utils.AttentionBase):
         self_losses = self._compute_loss_term(self.self_foreground_values, self.self_background_values)
         b, s = cross_losses.shape
 
-        # sum over samples and subjects
+
         total_cross_loss = cross_losses.sum()
         total_self_loss = self_losses.sum()
+        # # # MALeR: attribute loss sim and dissim
+        attribute_loss = self.maler_losses.compute_attribute_loss(
+            self.subject_attn_maps,
+            self._convert_boxes_to_masks,
+            self.subject_token_indices,
+            self.sym_kl,
+            self.dissim,
+            cross_losses.device
+        )
 
         loss = self.cross_loss_coef * total_cross_loss + self.self_loss_coef * total_self_loss
+        loss = loss + attribute_loss
         normalized_loss = loss / b / s
         return loss, normalized_loss
 
