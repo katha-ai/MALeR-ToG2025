@@ -567,7 +567,7 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoad
             self.vae.decoder.conv_in.to(dtype)
             self.vae.decoder.mid_block.to(dtype)
 
-    def update_loss(self, latents, i, t, prompt_embeds, cross_attention_kwargs, add_text_embeds, add_time_ids):
+    def update_loss(self, latents, i, t, prompt_embeds, cross_attention_kwargs, add_text_embeds, add_time_ids, prev_latents):
         def forward_pass(latent_model_input):
             latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
             added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
@@ -581,7 +581,7 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoad
             )
             self.unet.zero_grad()
 
-        return self.editor.update_loss(forward_pass, latents, i)
+        return self.editor.update_loss(forward_pass, latents, prev_latents, i)
 
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
@@ -833,9 +833,12 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoad
 
         latents = latents.half()
         prompt_embeds = prompt_embeds.half()
+
+        prev_latents = None
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
-                latents = self.update_loss(latents, i, t, prompt_embeds, cross_attention_kwargs, add_text_embeds, add_time_ids)
+                latents = self.update_loss(latents, i, t, prompt_embeds, cross_attention_kwargs, add_text_embeds, add_time_ids, prev_latents)
 
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
@@ -864,6 +867,8 @@ class StableDiffusionXLPipeline(DiffusionPipeline, FromSingleFileMixin, LoraLoad
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+                prev_latents = latents.detach()
 
                 # call the callback, if provided
                 if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
