@@ -7,6 +7,11 @@ Official codebase built over Bounded-Attention. For tracking MALeR losses additi
 <a href="https://arxiv.org/abs/2511.06002"><img src="https://img.shields.io/badge/arXiv-2511.06002-b31b1b.svg"></a>
 <a href="https://katha-ai.github.io/projects/maler/"><img src="https://img.shields.io/badge/Project-Website-orange"></a>
 
+<p align="center">
+<img src="images/MALeR_FastForwardVideo.gif" width="800px"/>
+</p>
+
+
 ### Setting-up the environment
 Create an environment of your choice, simply run
 ```
